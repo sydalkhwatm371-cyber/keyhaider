@@ -1244,7 +1244,12 @@ class MyKeyboardService : InputMethodService() {
                     v.getLocationOnScreen(loc)
                     val screenW = resources.displayMetrics.widthPixels
                     val x = (loc[0] + (v.width - w) / 2).coerceIn(0, maxOf(0, screenW - w))
-                    pw.showAtLocation(v, Gravity.NO_GRAVITY, x, loc[1] - h - dp(6))
+                    // نثبّت الشريط نسبةً للزر نفسه (فوقه مباشرة) حتى ما يتأثر بإزاحة نافذة الكيبورد
+                    try {
+                        pw.showAsDropDown(v, x - loc[0], -(v.height + h + dp(6)))
+                    } catch (e2: Exception) {
+                        pw.showAtLocation(v, Gravity.NO_GRAVITY, x, loc[1] - h - dp(6))
+                    }
                     altPopup = pw
                     lpX0 = x + dp(2)
                     lpViews = tvs
