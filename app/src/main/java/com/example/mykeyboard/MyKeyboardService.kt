@@ -1707,7 +1707,7 @@ class MyKeyboardService : InputMethodService() {
         typingMode = true
         applyTopMode()
         ui.removeCallbacks(idleRun)
-        ui.postDelayed(idleRun, 700)
+        ui.postDelayed(idleRun, 1500)
     }
 
     private fun learn(w0: String, prev0: String) {
