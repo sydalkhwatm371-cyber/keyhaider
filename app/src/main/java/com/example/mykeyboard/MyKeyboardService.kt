@@ -129,6 +129,7 @@ class MyKeyboardService : InputMethodService() {
     private var emojiCat = 0
     private val recentEmoji = ArrayList<String>()
     private var numRow = false
+    private var hideHints = false
 
     // إظهار الاقتراحات أثناء الكتابة فقط
     private var typingMode = false
@@ -428,6 +429,7 @@ class MyKeyboardService : InputMethodService() {
         hapticOn = prefs.getBoolean("hap", true)
         soundOn = prefs.getBoolean("snd", false)
         numRow = prefs.getBoolean("numRow", false)
+        hideHints = prefs.getBoolean("hideHints", false)
         trLang = prefs.getString("trLang", "en") ?: "en"
         try {
             prefs.getString("layouts3", null)?.let { s ->
@@ -488,6 +490,7 @@ class MyKeyboardService : InputMethodService() {
             .putBoolean("hap", hapticOn)
             .putBoolean("snd", soundOn)
             .putBoolean("numRow", numRow)
+            .putBoolean("hideHints", hideHints)
             .putString("params3", pj.toString())
             .putFloat("hs", heightScale)
             .putInt("gap", gapDp)
@@ -509,6 +512,7 @@ class MyKeyboardService : InputMethodService() {
         padL = 0; padR = 0; padB = 0
         arVar = 0; enVar = 0
         numRow = false
+        hideHints = false
         selId = null
         savePrefs()
     }
@@ -797,10 +801,13 @@ class MyKeyboardService : InputMethodService() {
             }
         }.toTypedArray()))
 
-        col.addView(section("صف الأرقام"))
+        col.addView(section("الأرقام والرموز الثانوية"))
         col.addView(hScroll(
             chip(if (numRow) "🔢 إضافة صف الأرقام: تشغيل" else "🔢 إضافة صف الأرقام: إيقاف", numRow) {
                 numRow = !numRow; savePrefs(); renderAll()
+            },
+            chip(if (hideHints) "🙈 الرموز خلف الحرف: مخفية" else "👁 الرموز خلف الحرف: ظاهرة", hideHints) {
+                hideHints = !hideHints; savePrefs(); renderAll()
             }
         ))
 
@@ -1076,7 +1083,7 @@ class MyKeyboardService : InputMethodService() {
                 val c = if (mode == AR) "،" else ","
                 key(id, c, w, h, pal.key, 20f) { type(c) }
             }
-            "::DOT" -> {
+            "::DOT", "." -> {
                 val arabicNow = mode == AR || (mode == SYM && lastLetterMode == AR)
                 val ex = if (arabicNow) harakat.map { if (it == "\u0640") it else "\u25CC" + it } else emptyList()
                 key(id, ".", w, h, pal.key, 20f, extras = ex) { type(".") }
@@ -1090,7 +1097,7 @@ class MyKeyboardService : InputMethodService() {
                 val s = display(id)
                 val ex = merged["${lk()}|$id"]?.map { display(it) } ?: emptyList()
                 key(id, s, w, h, pal.key, 22f, preview = true, extras = ex,
-                    hint = ex.take(1).joinToString("")) { type(s) }
+                    hint = if (hideHints) "" else ex.take(1).joinToString("")) { type(s) }
             }
         }
     }
@@ -1707,7 +1714,7 @@ class MyKeyboardService : InputMethodService() {
         typingMode = true
         applyTopMode()
         ui.removeCallbacks(idleRun)
-        ui.postDelayed(idleRun, 1500)
+        ui.postDelayed(idleRun, 700)
     }
 
     private fun learn(w0: String, prev0: String) {
