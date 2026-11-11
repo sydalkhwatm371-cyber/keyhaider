@@ -19,6 +19,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.text.InputType
 import android.text.Spannable
 import android.text.SpannableStringBuilder
@@ -140,6 +141,11 @@ class MyKeyboardService : InputMethodService() {
     private var trAuto = false
     private val trSeg = StringBuilder()
     private val trRun = Runnable { flushTranslate(false) }
+    // كشف اللصق من خارج الكيبورد (لصق من قائمة الحقل)
+    private var lastTouchAt = 0L
+    private var ownEditUntil = 0L
+    private var inputStartAt = 0L
+    private var snapAfter = ""
 
     // المحفظة (سجل النسخ)
     private val clips = ArrayList<String>()
@@ -267,6 +273,7 @@ class MyKeyboardService : InputMethodService() {
 
             // سحب أفقي من أي مكان على الأزرار = مسح كلمة
             override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+                lastTouchAt = SystemClock.uptimeMillis()
                 val enabled = panel == P_KEYS && !showSettings && !editMode &&
                         altPopup == null && curDownId != "::DEL"
                 when (ev.actionMasked) {
@@ -323,6 +330,8 @@ class MyKeyboardService : InputMethodService() {
         fieldNoSug = computeNoSug(info)
         trSeg.setLength(0)
         ui.removeCallbacks(trRun)
+        inputStartAt = SystemClock.uptimeMillis()
+        snapAfter = try { currentInputConnection?.getTextAfterCursor(300, 0)?.toString() ?: "" } catch (e: Exception) { "" }
         if (::root.isInitialized) renderAll()
     }
 
@@ -337,7 +346,33 @@ class MyKeyboardService : InputMethodService() {
         candidatesStart: Int, candidatesEnd: Int
     ) {
         super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
-        if (::root.isInitialized) updateSuggestions()
+        if (::root.isInitialized) {
+            detectPaste(oldSelStart, oldSelEnd, newSelStart, newSelEnd)
+            updateSuggestions()
+        }
+    }
+
+    /** إذا انلصق نص من خارج الكيبورد والترجمة التلقائية شغّالة، يترجمه مثل المكتوب */
+    private fun detectPaste(oS: Int, oE: Int, nS: Int, nE: Int) {
+        if (!trActive()) return
+        val ic = currentInputConnection ?: return
+        val after = try { ic.getTextAfterCursor(300, 0)?.toString() ?: "" } catch (e: Exception) { return }
+        val prevAfter = snapAfter
+        snapAfter = after
+        if (nS != nE || oS < 0 || nS - oS < 2) return
+        val now = SystemClock.uptimeMillis()
+        if (now - lastTouchAt < 700 || now < ownEditUntil || now - inputStartAt < 800) return
+        val n = nS - oS
+        if (n > 3000) return
+        // الإدراج يترك النص بعد المؤشر كما هو؛ أما تحريك المؤشر فيغيّره
+        if (after != prevAfter) return
+        val ins = try { ic.getTextBeforeCursor(n, 0)?.toString() } catch (e: Exception) { null } ?: return
+        if (ins.length != n || ins.isBlank()) return
+        trSeg.setLength(0)
+        trSeg.append(ins)
+        trGen++
+        ui.removeCallbacks(trRun)
+        ui.postDelayed(trRun, 250)
     }
 
     private fun computeNoSug(info: EditorInfo?): Boolean {
@@ -1916,6 +1951,7 @@ class MyKeyboardService : InputMethodService() {
 
     private fun replaceFieldText(newText: String, wasSelection: Boolean) {
         val ic = currentInputConnection ?: return
+        ownEditUntil = SystemClock.uptimeMillis() + 1500
         if (wasSelection) {
             ic.commitText(newText, 1)
         } else {
@@ -2078,6 +2114,7 @@ class MyKeyboardService : InputMethodService() {
                         val ic2 = currentInputConnection
                         val b2 = ic2?.getTextBeforeCursor(src.length, 0)?.toString() ?: ""
                         if (ic2 != null && b2 == src) {
+                            ownEditUntil = SystemClock.uptimeMillis() + 1500
                             val trailing = src.substring(src.trimEnd().length)
                             ic2.deleteSurroundingText(src.length, 0)
                             ic2.commitText(res + trailing, 1)
@@ -2096,8 +2133,8 @@ class MyKeyboardService : InputMethodService() {
     private fun translatePanel(): View {
         val box = compactBox()
         box.addView(label(
-            if (trAuto) "الترجمة التلقائية شغّالة ← " + trLang.uppercase() + " (كل شي تكتبه يترجم لحاله)"
-            else "اختر لغة، وبعدها كل شي تكتبه بالحقل يترجم تلقائياً",
+            if (trAuto) "الترجمة التلقائية شغّالة ← " + trLang.uppercase() + " (كل شي تكتبه أو تلصقه يترجم لحاله)"
+            else "اختر لغة، وبعدها كل شي تكتبه أو تلصقه بالحقل يترجم تلقائياً",
             12f, pal.text
         ).apply { setPadding(dp(4), dp(2), dp(4), dp(2)) })
 
