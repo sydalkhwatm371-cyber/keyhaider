@@ -60,27 +60,6 @@ class MainActivity : Activity() {
             }
         })
 
-        layout.addView(text("🎞️ مفتاح GIPHY (لتشغيل زر GIF)", 18f, true))
-        layout.addView(text(
-            "١) ادخل developers.giphy.com وسجّل دخول.\n" +
-            "٢) Create an App ثم اختر API (وليس SDK).\n" +
-            "٣) انسخ المفتاح (API Key) والصقه هنا واضغط حفظ.\n" +
-            "لا تحتاج إعادة بناء التطبيق.", 14f
-        ))
-        val keyField = EditText(this).apply {
-            hint = "الصق مفتاح GIPHY هنا"
-            setSingleLine(true)
-            setText(prefs.getString("giphy", ""))
-        }
-        layout.addView(keyField)
-        layout.addView(Button(this).apply {
-            text = "💾 حفظ المفتاح"
-            setOnClickListener {
-                prefs.edit().putString("giphy", keyField.text.toString().trim()).apply()
-                Toast.makeText(this@MainActivity, "تم حفظ المفتاح ✅", Toast.LENGTH_SHORT).show()
-            }
-        })
-
         layout.addView(text("🖼️ صورة خلفية للكيبورد", 18f, true))
         layout.addView(Button(this).apply {
             text = "اختيار صورة"

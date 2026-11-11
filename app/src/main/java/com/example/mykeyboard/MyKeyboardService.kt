@@ -128,7 +128,7 @@ class MyKeyboardService : InputMethodService() {
     private var hubTab = 0
     private var emojiCat = 0
     private val recentEmoji = ArrayList<String>()
-    private var showHarakat = false
+    private var numRow = false
 
     // إظهار الاقتراحات أثناء الكتابة فقط
     private var typingMode = false
@@ -427,6 +427,7 @@ class MyKeyboardService : InputMethodService() {
         sugOn = prefs.getBoolean("sug", true)
         hapticOn = prefs.getBoolean("hap", true)
         soundOn = prefs.getBoolean("snd", false)
+        numRow = prefs.getBoolean("numRow", false)
         trLang = prefs.getString("trLang", "en") ?: "en"
         try {
             prefs.getString("layouts3", null)?.let { s ->
@@ -486,6 +487,7 @@ class MyKeyboardService : InputMethodService() {
             .putBoolean("sug", sugOn)
             .putBoolean("hap", hapticOn)
             .putBoolean("snd", soundOn)
+            .putBoolean("numRow", numRow)
             .putString("params3", pj.toString())
             .putFloat("hs", heightScale)
             .putInt("gap", gapDp)
@@ -506,6 +508,7 @@ class MyKeyboardService : InputMethodService() {
         gapDp = 5
         padL = 0; padR = 0; padB = 0
         arVar = 0; enVar = 0
+        numRow = false
         selId = null
         savePrefs()
     }
@@ -682,7 +685,6 @@ class MyKeyboardService : InputMethodService() {
         })
         row.addView(toolBtn("𝓐", panel == P_FONT || activeStyle != null, 1f) { togglePanel(P_FONT) })
         row.addView(toolBtn("📋", panel == P_CLIP, 1f) { togglePanel(P_CLIP) })
-        row.addView(toolBtn("حَ", showHarakat, 1f) { showHarakat = !showHarakat; renderAll() })
         row.addView(toolBtn("⚙", showSettings, 1f) {
             panel = P_KEYS
             showSettings = !showSettings
@@ -794,6 +796,13 @@ class MyKeyboardService : InputMethodService() {
                 prefs.edit().putInt("accent", i).apply(); renderAll()
             }
         }.toTypedArray()))
+
+        col.addView(section("صف الأرقام"))
+        col.addView(hScroll(
+            chip(if (numRow) "🔢 إضافة صف الأرقام: تشغيل" else "🔢 إضافة صف الأرقام: إيقاف", numRow) {
+                numRow = !numRow; savePrefs(); renderAll()
+            }
+        ))
 
         col.addView(section("الاقتراحات والتفاعل  •  محفوظ: ${dict.size} كلمة"))
         col.addView(hScroll(
@@ -1020,26 +1029,21 @@ class MyKeyboardService : InputMethodService() {
 
     private val harakat = listOf("\u064E", "\u064F", "\u0650", "\u064B", "\u064C", "\u064D", "\u0651", "\u0652", "\u0670", "\u0640")
 
-    private fun harakatRow(): View {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutDirection = View.LAYOUT_DIRECTION_LTR
-        }
-        harakat.forEach { h ->
-            val label = if (h == "\u0640") h else "\u25CC" + h
-            row.addView(key("::H$h", label, 1f, 0.85f, pal.special, 22f) { type(h) })
-        }
-        return row
-    }
-
     private fun renderKeys() {
-        val arabicNow = mode == AR || (mode == SYM && lastLetterMode == AR)
-        if (showHarakat && arabicNow) content.addView(harakatRow())
+        // صف الأرقام يُتحكّم به من الإعدادات (يُضاف في الأعلى فقط عند تفعيله)
+        if (numRow && mode != SYM && !internalMode()) {
+            val nr = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutDirection = View.LAYOUT_DIRECTION_LTR
+            }
+            "1234567890".forEach { nr.addView(keyFor(it.toString())) }
+            content.addView(nr)
+        }
         for (r in layoutFor()) {
             if (r.isEmpty()) continue
-            // أثناء الكتابة داخل الكيبورد نخفي صف الأرقام لتوفير المساحة
-            if (internalMode() && mode != SYM && r.all { it.length == 1 && it[0].isDigit() }) continue
+            // نتجاهل أي صف أرقام مخزّن في التخطيط (خارج وضع الرموز)
+            if (mode != SYM && r.all { it.length == 1 && it[0].isDigit() }) continue
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
@@ -1072,7 +1076,11 @@ class MyKeyboardService : InputMethodService() {
                 val c = if (mode == AR) "،" else ","
                 key(id, c, w, h, pal.key, 20f) { type(c) }
             }
-            "::DOT" -> key(id, ".", w, h, pal.key, 20f) { type(".") }
+            "::DOT" -> {
+                val arabicNow = mode == AR || (mode == SYM && lastLetterMode == AR)
+                val ex = if (arabicNow) harakat.map { if (it == "\u0640") it else "\u25CC" + it } else emptyList()
+                key(id, ".", w, h, pal.key, 20f, extras = ex) { type(".") }
+            }
             "::SPACE" -> key(id, if (mode == AR) "مسافة" else "space", 4f * w, h, pal.key, 14f) { type(" ") }
             "::ENTER" -> {
                 val (txt, isAction) = enterLabel()
@@ -1154,7 +1162,7 @@ class MyKeyboardService : InputMethodService() {
         var lpSel = -1
         var lpX0 = 0
         var lpViews: List<TextView> = emptyList()
-        val optW = dp(40)
+        val optW = minOf(dp(40), (resources.displayMetrics.widthPixels - dp(8)) / maxOf(1, extras.size))
 
         val repeater = object : Runnable {
             override fun run() {
@@ -1295,7 +1303,7 @@ class MyKeyboardService : InputMethodService() {
                         lpActive = false
                         lpSel = -1
                         pressed = false
-                        if (sel >= 0 && sel < extras.size) type(extras[sel]) else act()
+                        if (sel >= 0 && sel < extras.size) type(extras[sel].removePrefix("\u25CC")) else act()
                     } else {
                         val was = pressed
                         pressed = false
@@ -1699,7 +1707,7 @@ class MyKeyboardService : InputMethodService() {
         typingMode = true
         applyTopMode()
         ui.removeCallbacks(idleRun)
-        ui.postDelayed(idleRun, 2500)
+        ui.postDelayed(idleRun, 700)
     }
 
     private fun learn(w0: String, prev0: String) {
@@ -2264,10 +2272,7 @@ class MyKeyboardService : InputMethodService() {
         box.addView(status)
 
         if (giphyKey().isEmpty()) {
-            status.text = "⚠️ زر GIF يحتاج مفتاح GIPHY مجاني (مرة واحدة فقط)"
-            box.addView(pill("🔑 أدخل المفتاح الآن", 1f, pal.accent, 44, 15f) { openKeyScreen() }.apply {
-                layoutParams = LinearLayout.LayoutParams(MATCH, dp(44)).apply { setMargins(dp(4), dp(6), dp(4), dp(4)) }
-            })
+            status.text = "⚠️ مفتاح GIPHY غير مضبوط داخل Config.kt"
         } else {
             box.addView(HorizontalScrollView(this).apply {
                 isHorizontalScrollBarEnabled = false
@@ -2393,14 +2398,6 @@ class MyKeyboardService : InputMethodService() {
             addView(list)
         })
         return box
-    }
-
-    private fun openKeyScreen() {
-        try {
-            startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-        } catch (e: Exception) {
-            toast("افتح تطبيق كيبوردي وضع المفتاح")
-        }
     }
 
     private fun loadGifs(q: String) {
