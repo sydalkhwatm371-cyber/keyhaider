@@ -713,7 +713,8 @@ class MyKeyboardService : InputMethodService() {
     private fun toolbar(): View {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            // من اليمين لليسار: رجوع ثم السمايلات يكونون جهة اليمين
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
         }
         if (panel != P_KEYS || showSettings) {
             row.addView(toolBtn("⌨ رجوع", true, 1.2f) { backToKeys() })
