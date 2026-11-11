@@ -1,6 +1,7 @@
 package com.example.mykeyboard
 
 import android.content.ClipDescription
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -49,6 +50,7 @@ import java.io.File
 import java.net.URL
 import java.util.Collections
 import java.util.concurrent.Executors
+import kotlin.math.abs
 import kotlin.math.min
 
 class Pal(
@@ -67,6 +69,12 @@ class MyKeyboardService : InputMethodService() {
         const val P_GIF = 1
         const val P_TR = 2
         const val P_FONT = 3
+        const val P_CLIP = 4
+
+        const val TAB_EMOJI = 0
+        const val TAB_SYM = 1
+        const val TAB_KAO = 2
+        const val TAB_GIF = 3
 
         val SELECT_BG = 0xFFF57C00.toInt()
         val ACCENTS = intArrayOf(
@@ -114,6 +122,28 @@ class MyKeyboardService : InputMethodService() {
     private var cachedPanel: View? = null
     private var cachedKind = -1
     private var altPopup: PopupWindow? = null
+    private var curDownId = ""
+
+    // اللوحة الموحدة (سمايلات / رموز / تعبيرية / GIF)
+    private var hubTab = 0
+    private var emojiCat = 0
+    private val recentEmoji = ArrayList<String>()
+    private var showHarakat = false
+
+    // إظهار الاقتراحات أثناء الكتابة فقط
+    private var typingMode = false
+    private var toolbarView: View? = null
+    private val idleRun = Runnable { typingMode = false; applyTopMode() }
+
+    // الترجمة التلقائية داخل الحقل
+    private var trAuto = false
+    private val trSeg = StringBuilder()
+    private val trRun = Runnable { flushTranslate(false) }
+
+    // المحفظة (سجل النسخ)
+    private val clips = ArrayList<String>()
+    private var clipMgr: ClipboardManager? = null
+    private val clipListener = ClipboardManager.OnPrimaryClipChangedListener { onClipChanged() }
 
     // الاقتراحات وذاكرة الكلمات
     private var fieldNoSug = false
@@ -156,7 +186,9 @@ class MyKeyboardService : InputMethodService() {
         "أبجدي" to listOf("ابتثجحخدذرزس", "شصضطظعغفقكل", "منهويةىءئؤ"),
         "أبجد هوز" to listOf("ابجدهوزحطيء", "كلمنسعفصقرش", "تثخذضظغةىئؤ"),
         "عراقي" to listOf("ضصثقفغعهخحجچ", "شسيبپلاتنمكگ", "دذطرزژوةڤ"),
-        "مبسط" to listOf("ضصقفغعهخحج", "شسيبلاتنمك", "دطرةوز")
+        "مبسط" to listOf("ضصقفغعهخحج", "شسيبلاتنمك", "دطرةوز"),
+        // مثل الصورة: (الحرف الأول يظهر أقصى اليمين)
+        "سامسونج" to listOf("جحخهعغفقثصض", "طكمنتالبيسش", "دظزوةىرؤءذ")
     )
 
     // أحرف تُدمج تلقائياً (ضغطة مطولة) لبعض الترتيبات: رقم الترتيب -> (الحرف -> المدموج معه)
@@ -169,6 +201,19 @@ class MyKeyboardService : InputMethodService() {
             "ا" to listOf("ء", "أ", "إ", "آ"), "و" to listOf("ؤ"),
             "ي" to listOf("ئ", "ى"), "ط" to listOf("ظ"),
             "د" to listOf("ذ"), "ت" to listOf("ث")
+        ),
+        // أرقام ورموز بالضغط المطوّل مثل الصورة
+        5 to mapOf(
+            "ض" to listOf("١", "1"), "ص" to listOf("٢", "2"), "ث" to listOf("٣", "3"),
+            "ق" to listOf("٤", "4"), "ف" to listOf("٥", "5"), "غ" to listOf("٦", "6"),
+            "ع" to listOf("٧", "7"), "ه" to listOf("٨", "8"), "خ" to listOf("٩", "9"),
+            "ح" to listOf("٠", "0"), "ج" to listOf("چ", "@"),
+            "ش" to listOf("ڜ"), "س" to listOf("\$"), "ي" to listOf("ئ"), "ب" to listOf("پ"),
+            "ل" to listOf("لا"), "ا" to listOf("أ", "إ", "آ"), "ت" to listOf("#"),
+            "ن" to listOf("("), "م" to listOf(")"), "ك" to listOf("گ"), "ط" to listOf("/"),
+            "ذ" to listOf("*"), "ؤ" to listOf("\""), "ر" to listOf("'"), "ى" to listOf("ئ"),
+            "ة" to listOf(":"), "و" to listOf("؛"), "ز" to listOf("ژ"), "ظ" to listOf("!"),
+            "د" to listOf("؟"), "ف" to listOf("٥", "5", "ڤ")
         )
     )
 
@@ -189,10 +234,17 @@ class MyKeyboardService : InputMethodService() {
         prefs = getSharedPreferences("kb", MODE_PRIVATE)
         loadPrefs()
         loadDict()
+        loadClips()
+        try {
+            clipMgr = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipMgr?.addPrimaryClipChangedListener(clipListener)
+        } catch (e: Exception) {
+        }
         cleanCache()
     }
 
     override fun onDestroy() {
+        try { clipMgr?.removePrimaryClipChangedListener(clipListener) } catch (e: Exception) { }
         saveDict(true)
         io.shutdownNow()
         super.onDestroy()
@@ -206,7 +258,56 @@ class MyKeyboardService : InputMethodService() {
     }
 
     override fun onCreateInputView(): View {
-        root = LinearLayout(this).apply {
+        root = object : LinearLayout(this) {
+            private var dX = 0f
+            private var dY = 0f
+            private var swiping = false
+            private var swipeN = 0
+
+            // سحب أفقي من أي مكان على الأزرار = مسح كلمة
+            override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+                val enabled = panel == P_KEYS && !showSettings && !editMode &&
+                        altPopup == null && curDownId != "::DEL"
+                when (ev.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        dX = ev.rawX; dY = ev.rawY
+                        swiping = false; swipeN = 0
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        if (enabled && !swiping) {
+                            val dx = ev.rawX - dX
+                            val dy = abs(ev.rawY - dY)
+                            if (dx >= dp(48) && dx > 2 * dy) {
+                                swiping = true
+                                swipeN = 0
+                                dismissPreview()
+                                return true
+                            }
+                        }
+                    }
+                }
+                return false
+            }
+
+            override fun onTouchEvent(ev: MotionEvent): Boolean {
+                if (!swiping) return super.onTouchEvent(ev)
+                when (ev.actionMasked) {
+                    MotionEvent.ACTION_MOVE -> {
+                        val dx = ev.rawX - dX
+                        val n = 1 + ((dx - dp(48)) / dp(40)).toInt()
+                        while (swipeN < n) {
+                            swipeN++
+                            deleteWord()
+                        }
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        swiping = false
+                        swipeN = 0
+                    }
+                }
+                return true
+            }
+        }.apply {
             orientation = LinearLayout.VERTICAL
             layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
@@ -219,6 +320,8 @@ class MyKeyboardService : InputMethodService() {
         super.onStartInputView(info, restarting)
         shift = false
         fieldNoSug = computeNoSug(info)
+        trSeg.setLength(0)
+        ui.removeCallbacks(trRun)
         if (::root.isInitialized) renderAll()
     }
 
@@ -315,6 +418,11 @@ class MyKeyboardService : InputMethodService() {
         padB = prefs.getInt("padB", 0).coerceAtLeast(0)
         arVar = prefs.getInt("arVar", 0).coerceIn(0, arVariants.size - 1)
         enVar = prefs.getInt("enVar", 0).coerceIn(0, enVariants.size - 1)
+        if (!prefs.getBoolean("mig5", false)) {
+            arVar = 5
+            prefs.edit().putInt("arVar", 5).putBoolean("mig5", true).apply()
+        }
+        prefs.getString("recentEmoji", "")?.split(" ")?.filter { it.isNotEmpty() }?.let { recentEmoji.addAll(it) }
         fontScale = prefs.getFloat("fs", 1f).coerceIn(0.6f, 1.5f)
         sugOn = prefs.getBoolean("sug", true)
         hapticOn = prefs.getBoolean("hap", true)
@@ -430,10 +538,12 @@ class MyKeyboardService : InputMethodService() {
             if (isAr) arMerges[k - 100]?.forEach { (t, ex) -> merged["$k|$t"] = ex.toMutableList() }
             // نخزّن الترتيب كما يظهر على الشاشة (من اليسار لليمين)
             fun v(s: String) = if (isAr) chars(s).reversed().toMutableList() else chars(s)
-            rows.add(chars("1234567890"))
+            val compact = isAr && k == 105
+            if (!compact) rows.add(chars("1234567890"))
             rows.add(v(src[0]))
             rows.add(v(src[1]))
-            rows.add((listOf("::SHIFT") + v(src[2]) + "::DEL").toMutableList())
+            if (compact) rows.add((v(src[2]) + "::DEL").toMutableList())
+            else rows.add((listOf("::SHIFT") + v(src[2]) + "::DEL").toMutableList())
         }
         rows.add(mutableListOf("::SYM", "::LANG", "::COMMA", "::SPACE", "::DOT", "::ENTER"))
         return rows
@@ -501,12 +611,17 @@ class MyKeyboardService : InputMethodService() {
         cachedKind = -1
         sugViews = emptyList()
         sugBar = null
+        typingMode = false
+        ui.removeCallbacks(idleRun)
         pal = computePal()
         root.background = makeBackground()
         applyPadding()
         root.removeAllViews()
-        root.addView(toolbar())
+        val tb = toolbar()
+        toolbarView = tb
+        root.addView(tb)
         if (sugActive()) root.addView(suggestionBar())
+        applyTopMode()
         if (showSettings && panel == P_KEYS) root.addView(settingsPanel())
         root.addView(content)
         renderContent()
@@ -521,15 +636,16 @@ class MyKeyboardService : InputMethodService() {
             P_GIF, P_TR -> {
                 val old = cachedPanel
                 val pv: View = if (old != null && cachedKind == panel) old else {
-                    val nv = if (panel == P_GIF) gifPanel() else translatePanel()
+                    val nv = if (panel == P_GIF) hubPanel() else translatePanel()
                     cachedPanel = nv
                     cachedKind = panel
                     nv
                 }
                 content.addView(pv)
-                renderKeys()
+                if (panel == P_TR || hubTab == TAB_GIF) renderKeys()
             }
             P_FONT -> content.addView(fontsPanel())
+            P_CLIP -> { captureClip(); content.addView(clipPanel()) }
         }
     }
 
@@ -560,10 +676,14 @@ class MyKeyboardService : InputMethodService() {
         if (panel != P_KEYS || showSettings) {
             row.addView(toolBtn("⌨ رجوع", true, 1.2f) { backToKeys() })
         }
-        row.addView(toolBtn("GIF", panel == P_GIF, 1f) { togglePanel(P_GIF) })
-        row.addView(toolBtn("文A ترجمة", panel == P_TR, 1.5f) { togglePanel(P_TR) })
-        row.addView(toolBtn("𝓐 زخرفة", panel == P_FONT || activeStyle != null, 1.5f) { togglePanel(P_FONT) })
-        row.addView(toolBtn("⚙ ضبط", showSettings, 1.2f) {
+        row.addView(toolBtn("😊", panel == P_GIF, 1f) { togglePanel(P_GIF) })
+        row.addView(toolBtn(if (trAuto) "文A·" + trLang.uppercase() else "文A", trAuto || panel == P_TR, if (trAuto) 1.5f else 1f) {
+            togglePanel(P_TR)
+        })
+        row.addView(toolBtn("𝓐", panel == P_FONT || activeStyle != null, 1f) { togglePanel(P_FONT) })
+        row.addView(toolBtn("📋", panel == P_CLIP, 1f) { togglePanel(P_CLIP) })
+        row.addView(toolBtn("حَ", showHarakat, 1f) { showHarakat = !showHarakat; renderAll() })
+        row.addView(toolBtn("⚙", showSettings, 1f) {
             panel = P_KEYS
             showSettings = !showSettings
             if (!showSettings) { editMode = false; selId = null }
@@ -898,7 +1018,24 @@ class MyKeyboardService : InputMethodService() {
 
     // ================= الأزرار =================
 
+    private val harakat = listOf("\u064E", "\u064F", "\u0650", "\u064B", "\u064C", "\u064D", "\u0651", "\u0652", "\u0670", "\u0640")
+
+    private fun harakatRow(): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+        harakat.forEach { h ->
+            val label = if (h == "\u0640") h else "\u25CC" + h
+            row.addView(key("::H$h", label, 1f, 0.85f, pal.special, 22f) { type(h) })
+        }
+        return row
+    }
+
     private fun renderKeys() {
+        val arabicNow = mode == AR || (mode == SYM && lastLetterMode == AR)
+        if (showHarakat && arabicNow) content.addView(harakatRow())
         for (r in layoutFor()) {
             if (r.isEmpty()) continue
             // أثناء الكتابة داخل الكيبورد نخفي صف الأرقام لتوفير المساحة
@@ -945,7 +1082,7 @@ class MyKeyboardService : InputMethodService() {
                 val s = display(id)
                 val ex = merged["${lk()}|$id"]?.map { display(it) } ?: emptyList()
                 key(id, s, w, h, pal.key, 22f, preview = true, extras = ex,
-                    hint = ex.take(2).joinToString("")) { type(s) }
+                    hint = ex.take(1).joinToString("")) { type(s) }
             }
         }
     }
@@ -1070,7 +1207,19 @@ class MyKeyboardService : InputMethodService() {
             }
         }
 
+        var repStarted = false
+        var swiping = false
+        var downX = 0f
+        var swipeN = 0
+        val repStart = Runnable {
+            if (pressed && !swiping) {
+                repStarted = true
+                repeater.run()
+            }
+        }
         val slack = dp(14)
+        val swipeStart = dp(28)
+        val swipeStep = dp(40)
         v.setOnTouchListener { view, ev ->
             when (ev.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
@@ -1080,13 +1229,15 @@ class MyKeyboardService : InputMethodService() {
                         renderAll()
                     } else {
                         pressed = true
+                        curDownId = id
+                        repStarted = false
+                        swiping = false
+                        swipeN = 0
+                        downX = ev.rawX
                         view.alpha = 0.8f
                         view.animate().scaleX(0.92f).scaleY(0.92f).setDuration(50).start()
                         if (preview) showPreview(view, text)
-                        if (repeat) {
-                            act()
-                            ui.postDelayed(repeater, 400)
-                        }
+                        if (repeat) ui.postDelayed(repStart, 350)
                         if (extras.isNotEmpty()) ui.postDelayed(lpRun, 380)
                     }
                 }
@@ -1099,6 +1250,23 @@ class MyKeyboardService : InputMethodService() {
                             lpViews.forEachIndexed { i, t ->
                                 t.background = if (i == idx) rounded(pal.accent, 8) else null
                                 t.setTextColor(if (i == idx) Color.WHITE else pal.text)
+                            }
+                        }
+                    } else if (id == "::DEL") {
+                        // سحب على زر الحذف = مسح كلمة (كل مسافة سحب تمسح كلمة إضافية)
+                        if (pressed) {
+                            val dx = abs(ev.rawX - downX)
+                            if (dx >= swipeStart) {
+                                if (!swiping) {
+                                    swiping = true
+                                    ui.removeCallbacks(repStart)
+                                    ui.removeCallbacks(repeater)
+                                }
+                                val n = 1 + ((dx - swipeStart) / swipeStep).toInt()
+                                while (swipeN < n) {
+                                    swipeN++
+                                    deleteWord()
+                                }
                             }
                         }
                     } else {
@@ -1115,8 +1283,10 @@ class MyKeyboardService : InputMethodService() {
                     }
                 }
                 MotionEvent.ACTION_UP -> {
+                    curDownId = ""
                     ui.removeCallbacks(lpRun)
                     ui.removeCallbacks(repeater)
+                    ui.removeCallbacks(repStart)
                     view.alpha = 1f
                     view.animate().scaleX(1f).scaleY(1f).setDuration(90).start()
                     dismissPreview()
@@ -1129,16 +1299,24 @@ class MyKeyboardService : InputMethodService() {
                     } else {
                         val was = pressed
                         pressed = false
-                        if (was && !repeat) act()
+                        if (was) {
+                            if (repeat) {
+                                if (!repStarted && !swiping) act()
+                            } else {
+                                act()
+                            }
+                        }
                     }
                 }
                 MotionEvent.ACTION_CANCEL -> {
+                    curDownId = ""
                     pressed = false
                     lpActive = false
                     view.alpha = 1f
                     view.animate().scaleX(1f).scaleY(1f).setDuration(90).start()
                     dismissPreview()
                     ui.removeCallbacks(repeater)
+                    ui.removeCallbacks(repStart)
                     ui.removeCallbacks(lpRun)
                 }
             }
@@ -1303,7 +1481,7 @@ class MyKeyboardService : InputMethodService() {
 
     // ================= الكتابة داخل الكيبورد =================
 
-    private fun internalMode() = panel == P_TR || panel == P_GIF
+    private fun internalMode() = panel == P_GIF && hubTab == TAB_GIF
 
     private fun compactBox(): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
@@ -1439,8 +1617,9 @@ class MyKeyboardService : InputMethodService() {
             orientation = LinearLayout.HORIZONTAL
             layoutDirection = View.LAYOUT_DIRECTION_LTR
             gravity = Gravity.CENTER_VERTICAL
-            layoutParams = LinearLayout.LayoutParams(MATCH, dp(36)).apply { setMargins(0, 0, 0, dp(2)) }
+            layoutParams = LinearLayout.LayoutParams(MATCH, dp(36)).apply { setMargins(0, dp(2), 0, dp(2)) }
             background = rounded(pal.panel, 8)
+            visibility = View.GONE
         }
         val slots = List(3) { idx ->
             TextView(this).apply {
@@ -1495,11 +1674,32 @@ class MyKeyboardService : InputMethodService() {
             refreshBuf()
         } else {
             val ic = currentInputConnection ?: return
-            if (cur.isNotEmpty()) ic.deleteSurroundingText(cur.length, 0)
+            if (cur.isNotEmpty()) {
+                ic.deleteSurroundingText(cur.length, 0)
+                trDeleted(cur.length)
+            }
             ic.commitText("$w ", 1)
+            if (trActive()) trTyped("$w ")
         }
         if (sugOn) learn(w, prev)
+        markTyping()
         ui.post { updateSuggestions() }
+    }
+
+    private fun applyTopMode() {
+        val sb = sugBar
+        val showSug = typingMode && sb != null
+        toolbarView?.visibility = if (showSug) View.GONE else View.VISIBLE
+        sb?.visibility = if (showSug) View.VISIBLE else View.GONE
+    }
+
+    /** عند الكتابة: تظهر الاقتراحات مكان الأزرار، وبعد التوقف ترجع الأزرار */
+    private fun markTyping() {
+        if (sugBar == null) return
+        typingMode = true
+        applyTopMode()
+        ui.removeCallbacks(idleRun)
+        ui.postDelayed(idleRun, 2500)
     }
 
     private fun learn(w0: String, prev0: String) {
@@ -1571,11 +1771,12 @@ class MyKeyboardService : InputMethodService() {
     // ================= الإدخال =================
 
     private fun type(s: String) {
-        // الكتابة داخل الكيبورد (ترجمة / بحث GIF)
+        // الكتابة داخل الكيبورد (بحث GIF فقط)
         if (internalMode()) {
             if (s.isNotEmpty() && !isWordChar(s[0])) learnCurrent()
             kbBuf.append(s)
             refreshBuf()
+            markTyping()
             updateSuggestions()
             if (shift) {
                 shift = false
@@ -1596,11 +1797,13 @@ class MyKeyboardService : InputMethodService() {
             ic.commitText(st.applyChar(s), 1)
         } else {
             ic.commitText(s, 1)
+            if (trActive()) trTyped(s)
         }
         if (shift) {
             shift = false
             renderContent()
         }
+        markTyping()
         ui.post { updateSuggestions() }
     }
 
@@ -1608,22 +1811,69 @@ class MyKeyboardService : InputMethodService() {
         if (internalMode()) {
             if (kbBuf.isNotEmpty()) kbBuf.setLength(kbBuf.length - 1)
             refreshBuf()
+            markTyping()
             updateSuggestions()
             return
         }
         val ic = currentInputConnection ?: return
         val selected = ic.getSelectedText(0)
-        if (!selected.isNullOrEmpty()) ic.commitText("", 1)
-        else ic.deleteSurroundingText(1, 0)
+        if (!selected.isNullOrEmpty()) {
+            ic.commitText("", 1)
+            trReset()
+        } else {
+            ic.deleteSurroundingText(1, 0)
+            trDeleted(1)
+        }
+        markTyping()
+    }
+
+    /** يمسح الكلمة السابقة للمؤشر (أو النص المحدد) */
+    private fun deleteWord() {
+        if (internalMode()) {
+            var i = kbBuf.length
+            while (i > 0 && kbBuf[i - 1].isWhitespace()) i--
+            while (i > 0 && !kbBuf[i - 1].isWhitespace()) i--
+            kbBuf.setLength(i)
+            refreshBuf()
+            markTyping()
+            updateSuggestions()
+            return
+        }
+        val ic = currentInputConnection ?: return
+        val sel = ic.getSelectedText(0)
+        if (!sel.isNullOrEmpty()) {
+            ic.commitText("", 1)
+            trReset()
+            return
+        }
+        val b = ic.getTextBeforeCursor(80, 0)?.toString() ?: return
+        var i = b.length
+        while (i > 0 && b[i - 1].isWhitespace()) i--
+        while (i > 0 && !b[i - 1].isWhitespace()) i--
+        val n = b.length - i
+        if (n > 0) {
+            ic.deleteSurroundingText(n, 0)
+            trDeleted(n)
+        }
+        markTyping()
     }
 
     private fun pressEnter() {
         if (internalMode()) {
             learnCurrent()
-            if (panel == P_TR) doTranslate(trLang) else gifSearch()
+            gifSearch()
             return
         }
         learnCurrent()
+        if (trActive() && trSeg.isNotBlank()) {
+            ui.removeCallbacks(trRun)
+            flushTranslate(true)
+            return
+        }
+        doEnter()
+    }
+
+    private fun doEnter() {
         val ic = currentInputConnection ?: return
         val info = currentInputEditorInfo
         val opts = info?.imeOptions ?: 0
@@ -1724,30 +1974,117 @@ class MyKeyboardService : InputMethodService() {
         return box
     }
 
-    // ================= الترجمة =================
 
+    // ================= بيانات السمايلات والرموز =================
+
+    private val emojiCats: List<Pair<String, List<String>>> by lazy {
+        fun l(s: String) = s.split(" ").filter { it.isNotEmpty() }
+        listOf(
+            "😀" to l("😀 😃 😄 😁 😆 😅 😂 🤣 🥲 ☺️ 😊 😇 🙂 🙃 😉 😌 😍 🥰 😘 😗 😙 😚 😋 😛 😝 😜 🤪 🤨 🧐 🤓 😎 🥸 🤩 🥳 😏 😒 😞 😔 😟 😕 🙁 ☹️ 😣 😖 😫 😩 🥺 😢 😭 😤 😠 😡 🤬 🤯 😳 🥵 🥶 😱 😨 😰 😥 😓 🤗 🤔 🫣 🤭 🤫 🫡 🤥 😶 😐 😑 😬 🙄 😯 😦 😧 😮 😲 🥱 😴 🤤 😪 😵 🤐 🥴 🤢 🤮 🤧 😷 🤒 🤕 🤑 🤠 😈 👿 👹 👺 🤡 💩 👻 💀 ☠️ 👽 👾 🤖 🎃 😺 😸 😹 😻 😼 😽 🙀 😿 😾"),
+            "👋" to l("👋 🤚 🖐️ ✋ 🖖 👌 🤌 🤏 ✌️ 🤞 🫰 🤟 🤘 🤙 👈 👉 👆 🖕 👇 ☝️ 👍 👎 ✊ 👊 🤛 🤜 👏 🙌 👐 🤲 🤝 🙏 ✍️ 💅 🤳 💪 🦾 🦵 🦶 👂 👃 🧠 🫀 🫁 🦷 🦴 👀 👁️ 👅 👄 💋 🩸 👶 🧒 👦 👧 🧑 👱 👨 🧔 👩 🧓 👴 👵 🙍 🙎 🙅 🙆 💁 🙋 🧏 🙇 🤦 🤷 👮 🕵️ 💂 🥷 👷 🤴 👸 👳 👲 🧕 🤵 👰 🤰 🤱 👼 🎅 🤶 🦸 🦹 🧙 🧚 🧛 🧜 🧝 🧞 🧟 💆 💇 🚶 🏃 💃 🕺 👯 🧖 🧘"),
+            "❤️" to l("❤️ 🧡 💛 💚 💙 💜 🖤 🤍 🤎 💔 ❣️ 💕 💞 💓 💗 💖 💘 💝 💟 ♥️ 😍 🥰 😘 💋 💌 💐 🌹 🥀 🌺 🌸 🌼 🌷"),
+            "🐶" to l("🐶 🐱 🐭 🐹 🐰 🦊 🐻 🐼 🐨 🐯 🦁 🐮 🐷 🐸 🐵 🙈 🙉 🙊 🐒 🐔 🐧 🐦 🐤 🦆 🦅 🦉 🦇 🐺 🐗 🐴 🦄 🐝 🐛 🦋 🐌 🐞 🐜 🐢 🐍 🦎 🐙 🦑 🦐 🦀 🐠 🐟 🐬 🐳 🐋 🦈 🐊 🐅 🐆 🦓 🦍 🐘 🦏 🐪 🐫 🦒 🐃 🐂 🐄 🐎 🐖 🐏 🐑 🐐 🦌 🐕 🐩 🐈 🐓 🦃 🕊️ 🐇 🐁 🐀 🌵 🎄 🌲 🌳 🌴 🌱 🌿 ☘️ 🍀 🍁 🍂 🍃 🌾 🌻 ⭐ 🌟 ✨ ⚡ 🔥 🌈 ☀️ 🌤️ ⛅ ☁️ 🌧️ ⛈️ ❄️ ☃️ 💧 🌊"),
+            "🍎" to l("🍏 🍎 🍐 🍊 🍋 🍌 🍉 🍇 🍓 🫐 🍈 🍒 🍑 🥭 🍍 🥥 🥝 🍅 🍆 🥑 🥦 🥒 🌶️ 🌽 🥕 🧄 🧅 🥔 🍠 🥐 🍞 🥖 🥨 🧀 🥚 🍳 🥞 🧇 🥓 🥩 🍗 🍖 🌭 🍔 🍟 🍕 🥪 🌮 🌯 🥙 🍝 🍜 🍲 🍛 🍣 🍱 🍤 🍙 🍚 🍘 🍥 🥟 🍦 🍧 🍨 🍩 🍪 🎂 🍰 🧁 🍫 🍬 🍭 🍮 🍯 🍼 🥛 ☕ 🍵 🧃 🥤 🍺 🍻 🥂 🍷 🥃 🍸 🍹 🍾 🧊 🥄 🍴 🍽️"),
+            "⚽" to l("⚽ 🏀 🏈 ⚾ 🥎 🎾 🏐 🏉 🥏 🎱 🏓 🏸 🥅 🏒 🏑 🥍 🏏 ⛳ 🏹 🎣 🥊 🥋 🎽 ⛸️ 🥌 🛹 🛷 ⛷️ 🏂 🏋️ 🤸 🤺 🏇 🧘 🏄 🏊 🚣 🚴 🏆 🥇 🥈 🥉 🏅 🎖️ 🎫 🎟️ 🎪 🎭 🎨 🎬 🎤 🎧 🎼 🎹 🥁 🎷 🎺 🎸 🎻 🎲 🎯 🎳 🎮 🎰 🧩"),
+            "🚗" to l("🚗 🚕 🚙 🚌 🚎 🏎️ 🚓 🚑 🚒 🚐 🚚 🚛 🚜 🛵 🏍️ 🚲 🛴 🚨 🚔 🚍 🚘 🚖 ✈️ 🛫 🛬 🚀 🛸 🚁 ⛵ 🚤 🛳️ ⚓ 🚂 🚆 🚇 🚊 🗺️ 🗽 🗼 🏰 🏯 🏟️ 🎡 🎢 🎠 ⛲ 🏖️ 🏝️ 🏜️ 🌋 ⛰️ 🏔️ 🏕️ 🏠 🏡 🏢 🏣 🏥 🏦 🏨 🏪 🏫 🏭 ⛪ 🕌 🕍 🕋 🌅 🌄 🌃 🌉 🌌"),
+            "💡" to l("⌚ 📱 💻 ⌨️ 🖥️ 🖨️ 🖱️ 💽 💾 📀 📷 📹 🎥 📞 ☎️ 📟 📺 📻 ⏰ ⏳ 🔋 🔌 💡 🔦 🕯️ 💸 💵 💴 💶 💷 💰 💳 💎 ⚖️ 🔧 🔨 ⚒️ 🛠️ ⛏️ 🔩 ⚙️ 🧲 💣 🔪 🗡️ 🛡️ 🔮 🧿 💈 🔭 🔬 💊 💉 🧬 🦠 🌡️ 🧹 🧺 🧻 🚽 🚿 🛁 🔑 🗝️ 🚪 🛏️ 🛋️ 🎁 🎈 🎀 🎊 🎉 ✉️ 📦 📫 📝 📁 📅 📌 📎 ✂️ 🔒 🔓 🔔 📢 📣 💬 💭 🗯️"),
+            "🔣" to l("✅ ❌ ❎ ⭕ ❗ ❓ ❕ ❔ ‼️ ⁉️ 💯 🔞 📵 🚫 ⛔ ⚠️ ♻️ 🔱 ⚜️ ✔️ ☑️ ➕ ➖ ➗ ✖️ 💲 ™️ ©️ ®️ 🔴 🟠 🟡 🟢 🔵 🟣 ⚫ ⚪ 🟤 🔺 🔻 🔶 🔷 ▶️ ⏸️ ⏹️ ⏺️ ⏭️ ⏮️ 🔀 🔁 🔄 ⬆️ ⬇️ ⬅️ ➡️ ↗️ ↘️ ↙️ ↖️ ↕️ ↔️ ☪️ ✡️ ☯️ ☮️"),
+            "🏁" to l("🇮🇶 🇸🇦 🇦🇪 🇰🇼 🇶🇦 🇧🇭 🇴🇲 🇾🇪 🇯🇴 🇸🇾 🇱🇧 🇵🇸 🇪🇬 🇱🇾 🇹🇳 🇩🇿 🇲🇦 🇸🇩 🇹🇷 🇮🇷 🇺🇸 🇬🇧 🇫🇷 🇩🇪 🇪🇸 🇮🇹 🇷🇺 🇨🇳 🇯🇵 🇰🇷 🇮🇳 🇵🇰 🇧🇷 🇦🇷 🇨🇦 🇦🇺 🏳️ 🏴 🏁 🚩")
+        )
+    }
+
+    private val symbolsList: List<String> by lazy {
+        ("★ ☆ ♥ ♡ ♦ ♣ ♠ ✓ ✔ ✗ ✘ ➜ → ← ↑ ↓ ↔ ✦ ✧ ☀ ☁ ☂ ☺ ☻ ♪ ♫ ♬ ✆ ✉ ☎ ✂ ✎ ✏ © ® ™ € £ ¥ ₹ ¢ \$ ° ± × ÷ ≠ ≈ ≤ ≥ ∞ √ π Ω µ § ¶ • ◦ ▪ ▫ ■ □ ▲ △ ▼ ▽ ◆ ◇ ○ ● ◎ ☯ ☮ ☪ ♀ ♂ ⚡ ❄ ☘ ❀ ✿ ❁ ❤ ❣ ❥ ‹ › « » “ ” ‘ ’ … ‰ ‼ ⁉ ؟ ، ؛ ٪ ﷺ ﷻ ﴾ ﴿ ۝ ۞ ۩ ﷽")
+            .split(" ").filter { it.isNotEmpty() }
+    }
+
+    private val kaomojiList = listOf(
+        ":)", ":(", ":D", ";)", ":P", ":O", ":*", "<3", "XD", ":'(",
+        "(^_^)", "(^o^)", "(T_T)", "(>_<)", "(¬_¬)", "(o_O)", "(ಠ_ಠ)", "( ͡° ͜ʖ ͡°)",
+        "ʕ•ᴥ•ʔ", "(╯°□°)╯︵ ┻━┻", "┬─┬ ノ( ゜-゜ノ)", "¯\\_(ツ)_/¯", "(づ｡◕‿‿◕｡)づ",
+        "(っ◔◡◔)っ ♥", "(ʘ‿ʘ)", "(◕‿◕)", "(｡•́︿•̀｡)", "٩(◕‿◕)۶", "(☞ﾟヮﾟ)☞", "(≧▽≦)",
+        "(✿◠‿◠)", "♪┏(・o･)┛♪", "(ᵔᴥᵔ)", "(•‿•)", "(｡♥‿♥｡)", "(¬‿¬)", "ヽ(´▽`)/",
+        "(︶︹︺)", "(ง •̀_•́)ง", "(°o°)", "(҂◡_◡)", "ლ(ಠ益ಠლ)"
+    )
+
+    // ================= الترجمة التلقائية =================
+
+    private fun trActive() = trAuto && !fieldNoSug && activeStyle == null
+
+    private fun trTyped(s: String) {
+        trSeg.append(s)
+        trGen++
+        ui.removeCallbacks(trRun)
+        ui.postDelayed(trRun, 900)
+    }
+
+    private fun trDeleted(n: Int) {
+        if (!trAuto) return
+        trSeg.setLength(maxOf(0, trSeg.length - n))
+        trGen++
+        ui.removeCallbacks(trRun)
+        if (trSeg.isNotBlank()) ui.postDelayed(trRun, 900)
+    }
+
+    private fun trReset() {
+        trSeg.setLength(0)
+        trGen++
+        ui.removeCallbacks(trRun)
+    }
+
+    /** يترجم ما كُتب (منذ آخر ترجمة) ويستبدله بالترجمة داخل الحقل */
+    private fun flushTranslate(thenEnter: Boolean) {
+        if (!trActive()) {
+            if (thenEnter) doEnter()
+            return
+        }
+        val src = trSeg.toString()
+        val ic = currentInputConnection
+        if (src.isBlank() || ic == null) {
+            trSeg.setLength(0)
+            if (thenEnter) doEnter()
+            return
+        }
+        val before = ic.getTextBeforeCursor(src.length, 0)?.toString() ?: ""
+        if (before != src) {
+            // المؤشر تغيّر أو النص تعدّل من مكان آخر
+            trSeg.setLength(0)
+            if (thenEnter) doEnter()
+            return
+        }
+        val gen = ++trGen
+        val lang = trLang
+        io.execute {
+            val res: String? = try { Net.translate(src.trim(), lang) } catch (e: Exception) { null }
+            ui.post {
+                val ok = gen == trGen
+                if (ok) {
+                    if (res != null) {
+                        val ic2 = currentInputConnection
+                        val b2 = ic2?.getTextBeforeCursor(src.length, 0)?.toString() ?: ""
+                        if (ic2 != null && b2 == src) {
+                            val trailing = src.substring(src.trimEnd().length)
+                            ic2.deleteSurroundingText(src.length, 0)
+                            ic2.commitText(res + trailing, 1)
+                        }
+                        trSeg.setLength(0)
+                    } else {
+                        toast("تعذّرت الترجمة، تأكد من الإنترنت")
+                    }
+                }
+                if (thenEnter) doEnter()
+            }
+        }
+    }
+
+    /** لوحة اختيار لغة الترجمة التلقائية */
     private fun translatePanel(): View {
         val box = compactBox()
-        trResult = ""
-
-        val top = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutDirection = View.LAYOUT_DIRECTION_LTR
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        top.addView(inputBox("اكتب النص هنا بالكيبورد ثم اختر لغة الترجمة"))
-        top.addView(smallBtn("📋", 44, pal.key) {
-            kbBuf.setLength(0)
-            kbBuf.append(fieldText().first)
-            refreshBuf()
-            updateSuggestions()
-        })
-        top.addView(smallBtn("🗑", 44, pal.key) {
-            kbBuf.setLength(0)
-            refreshBuf()
-            updateSuggestions()
-        })
-        box.addView(top)
+        box.addView(label(
+            if (trAuto) "الترجمة التلقائية شغّالة ← " + trLang.uppercase() + " (كل شي تكتبه يترجم لحاله)"
+            else "اختر لغة، وبعدها كل شي تكتبه بالحقل يترجم تلقائياً",
+            12f, pal.text
+        ).apply { setPadding(dp(4), dp(2), dp(4), dp(2)) })
 
         val langs = listOf(
             "العربية" to "ar", "English" to "en", "Türkçe" to "tr", "فارسی" to "fa",
@@ -1755,60 +2092,142 @@ class MyKeyboardService : InputMethodService() {
             "Русский" to "ru", "Italiano" to "it", "中文" to "zh-CN", "हिन्दी" to "hi"
         )
         box.addView(hScroll(*langs.map { (name, code) ->
-            chip(name, code == trLang) { doTranslate(code) }
+            chip(name, trAuto && code == trLang) {
+                trLang = code
+                trAuto = true
+                trReset()
+                prefs.edit().putString("trLang", code).apply()
+                toast("الترجمة التلقائية ← $name")
+                backToKeys()
+            }
         }.toTypedArray()))
 
-        val out = label("اضغط على اللغة وتنكتب الترجمة بالحقل تلقائياً", 12f).apply {
-            gravity = Gravity.CENTER
-            setPadding(0, dp(1), 0, dp(1))
-        }
-        trOut = out
-        box.addView(out)
+        box.addView(hScroll(
+            chip("⏹ إيقاف الترجمة", false) {
+                trAuto = false
+                trReset()
+                backToKeys()
+            },
+            chip("✍ ترجم نص الحقل الآن", false) { translateField() }
+        ))
         return box
     }
 
-    private fun doTranslate(lang: String) {
-        trLang = lang
-        prefs.edit().putString("trLang", lang).apply()
-        val fromBuf = kbBuf.isNotBlank()
-        val src: String
-        val wasSel: Boolean
-        if (fromBuf) {
-            src = kbBuf.toString()
-            wasSel = false
-        } else {
-            // إذا مربع الكيبورد فارغ نترجم نص الحقل (المحدد أو الكل)
-            val (t, sel) = fieldText()
-            src = t
-            wasSel = sel
-        }
-        if (src.isBlank()) { trOut?.text = "اكتب النص بالكيبورد أولاً"; return }
+    /** يترجم كل نص الحقل (أو المحدد) مرة وحدة ويستبدله */
+    private fun translateField() {
+        val (t, sel) = fieldText()
+        if (t.isBlank()) { toast("ما كو نص بالحقل"); return }
+        val lang = trLang
         val gen = ++trGen
-        trOut?.text = "جاري الترجمة…"
         io.execute {
-            try {
-                val res = Net.translate(src, lang)
-                ui.post {
-                    if (gen != trGen) return@post
-                    trResult = res
-                    if (fromBuf) {
-                        currentInputConnection?.commitText(res, 1)
-                        kbBuf.setLength(0)
-                    } else {
-                        replaceFieldText(res, wasSel)
-                    }
+            val res: String? = try { Net.translate(t, lang) } catch (e: Exception) { null }
+            ui.post {
+                if (gen != trGen) return@post
+                if (res != null) {
+                    replaceFieldText(res, sel)
                     backToKeys()
+                } else {
+                    toast("تعذّرت الترجمة، تأكد من الإنترنت")
                 }
-            } catch (e: Exception) {
-                ui.post { if (gen == trGen) trOut?.text = "تعذّرت الترجمة، تأكد من الإنترنت" }
             }
         }
+    }
+
+    // ================= اللوحة الموحدة: سمايلات + رموز + تعبيرية + GIF =================
+
+    private fun hubTabs(): View {
+        val r = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        r.addView(pill("ABC", 1f, pal.accent, 38, 13f) { backToKeys() })
+        val tabs = listOf(
+            Triple("😀", TAB_EMOJI, 1f), Triple("♥ رموز", TAB_SYM, 1.5f),
+            Triple("(ᵔᴥᵔ)", TAB_KAO, 1.5f), Triple("GIF", TAB_GIF, 1f)
+        )
+        tabs.forEach { (name, t, w) ->
+            r.addView(pill(name, w, if (hubTab == t) pal.accent else pal.key, 38, 13f) {
+                if (hubTab != t) { hubTab = t; renderAll() }
+            })
+        }
+        r.addView(holdBtn("⌫") { deleteOne() })
+        return r
+    }
+
+    private fun hubPanel(): View {
+        if (hubTab == TAB_GIF) return gifPanel()
+        val box = panelBox()
+        box.addView(hubTabs())
+        when (hubTab) {
+            TAB_EMOJI -> {
+                val cats = emojiCats
+                val catChips = mutableListOf<View>()
+                catChips.add(chip("🕘", emojiCat == -1) { emojiCat = -1; renderAll() })
+                cats.forEachIndexed { i, c ->
+                    catChips.add(chip(c.first, emojiCat == i) { emojiCat = i; renderAll() })
+                }
+                box.addView(hScroll(*catChips.toTypedArray()))
+                val items = if (emojiCat == -1) {
+                    if (recentEmoji.isEmpty()) cats[0].second.take(24) else recentEmoji.toList()
+                } else cats[emojiCat.coerceIn(0, cats.size - 1)].second
+                box.addView(emojiGrid(items, 8, 24f) { pickEmoji(it) })
+            }
+            TAB_SYM -> box.addView(emojiGrid(symbolsList, 8, 22f) { pickText(it) })
+            else -> box.addView(emojiGrid(kaomojiList, 3, 15f) { pickText(it) })
+        }
+        return box
+    }
+
+    private fun emojiGrid(items: List<String>, cols: Int, size: Float, onPick: (String) -> Unit): View {
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val cellH = if (cols >= 6) dp(44) else dp(40)
+        items.chunked(cols).forEach { chunk ->
+            val r = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                layoutDirection = View.LAYOUT_DIRECTION_LTR
+            }
+            chunk.forEach { e ->
+                r.addView(TextView(this).apply {
+                    text = e
+                    textSize = size
+                    gravity = Gravity.CENTER
+                    setTextColor(pal.text)
+                    maxLines = 1
+                    layoutParams = LinearLayout.LayoutParams(0, cellH, 1f)
+                    setOnClickListener { fx(it); onPick(e) }
+                    pressFx(this)
+                })
+            }
+            repeat(cols - chunk.size) {
+                r.addView(View(this).apply { layoutParams = LinearLayout.LayoutParams(0, cellH, 1f) })
+            }
+            col.addView(r)
+        }
+        return ScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(MATCH, 0, 1f)
+            addView(col)
+        }
+    }
+
+    private fun pickText(t: String) {
+        currentInputConnection?.commitText(t, 1)
+        if (trActive()) trTyped(t)
+    }
+
+    private fun pickEmoji(e: String) {
+        pickText(e)
+        recentEmoji.remove(e)
+        recentEmoji.add(0, e)
+        while (recentEmoji.size > 32) recentEmoji.removeAt(recentEmoji.size - 1)
+        prefs.edit().putString("recentEmoji", recentEmoji.joinToString(" ")).apply()
     }
 
     // ================= GIF =================
 
     private fun gifPanel(): View {
         val box = compactBox()
+        box.addView(hubTabs())
         val status = label("", 12f).apply {
             gravity = Gravity.CENTER
             setPadding(0, dp(1), 0, dp(1))
@@ -1852,7 +2271,7 @@ class MyKeyboardService : InputMethodService() {
         } else {
             box.addView(HorizontalScrollView(this).apply {
                 isHorizontalScrollBarEnabled = false
-                layoutParams = LinearLayout.LayoutParams(MATCH, dp(96))
+                layoutParams = LinearLayout.LayoutParams(MATCH, dp(84))
                 addView(strip)
             })
             loadGifs("")
@@ -1867,6 +2286,113 @@ class MyKeyboardService : InputMethodService() {
             return
         }
         loadGifs(q)
+    }
+
+    // ================= المحفظة (سجل النسخ) =================
+
+    private fun captureClip(): Boolean {
+        try {
+            val c = clipMgr?.primaryClip ?: return false
+            if (c.itemCount == 0) return false
+            if (Build.VERSION.SDK_INT >= 33 &&
+                c.description.extras?.getBoolean("android.content.extra.IS_SENSITIVE") == true
+            ) return false
+            val t = c.getItemAt(0).coerceToText(this)?.toString()?.trim() ?: return false
+            if (t.isEmpty() || t.length > 3000) return false
+            if (clips.isNotEmpty() && clips[0] == t) return false
+            clips.remove(t)
+            clips.add(0, t)
+            while (clips.size > 40) clips.removeAt(clips.size - 1)
+            saveClips()
+            return true
+        } catch (e: Exception) {
+            return false
+        }
+    }
+
+    private fun onClipChanged() {
+        val changed = captureClip()
+        if (changed && ::root.isInitialized && panel == P_CLIP) renderContent()
+    }
+
+    private fun saveClips() {
+        val snap = ArrayList(clips)
+        io.execute {
+            try {
+                File(filesDir, "clips.json").writeText(JSONArray(snap).toString())
+            } catch (e: Exception) {
+            }
+        }
+    }
+
+    private fun loadClips() {
+        try {
+            val f = File(filesDir, "clips.json")
+            if (!f.exists()) return
+            val a = JSONArray(f.readText())
+            for (i in 0 until a.length()) clips.add(a.getString(i))
+        } catch (e: Exception) {
+            clips.clear()
+        }
+    }
+
+    private fun clipPanel(): View {
+        val box = panelBox()
+        val top = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+        top.addView(pill("⌨ رجوع", 1f, pal.accent, 38, 13f) { backToKeys() })
+        top.addView(pill("🗑 مسح الكل", 1f, pal.key, 38, 13f) {
+            clips.clear()
+            saveClips()
+            renderContent()
+        })
+        box.addView(top)
+        box.addView(label(
+            if (clips.isEmpty()) "انسخ أي نص وراح يظهر هنا، واضغط عليه حتى يتلصق"
+            else "اضغط على النص للصقه  •  ✕ للحذف",
+            12f
+        ).apply { setPadding(dp(4), dp(2), dp(4), dp(2)) })
+
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        clips.toList().forEach { t ->
+            val r = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                layoutDirection = View.LAYOUT_DIRECTION_LTR
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            val tv = TextView(this).apply {
+                text = t
+                textSize = 15f
+                maxLines = 3
+                ellipsize = TextUtils.TruncateAt.END
+                setTextColor(pal.text)
+                background = rounded(pal.key)
+                setPadding(dp(10), dp(8), dp(10), dp(8))
+                layoutParams = LinearLayout.LayoutParams(0, WRAP, 1f).apply {
+                    setMargins(dp(2), dp(2), dp(2), dp(2))
+                }
+                setOnClickListener {
+                    fx(it)
+                    currentInputConnection?.commitText(t, 1)
+                    if (trActive()) trTyped(t)
+                }
+                pressFx(this)
+            }
+            r.addView(tv)
+            r.addView(smallBtn("✕", 40, pal.key) {
+                clips.remove(t)
+                saveClips()
+                renderContent()
+            })
+            list.addView(r)
+        }
+        box.addView(ScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(MATCH, 0, 1f)
+            addView(list)
+        })
+        return box
     }
 
     private fun openKeyScreen() {
